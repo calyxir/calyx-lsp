@@ -1,0 +1,20 @@
+[package]
+name = "calyx-lsp"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tower-lsp = "0.20"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+tree-sitter = "0.20.10"
+
+[dependencies.tokio]
+version = "1"
+features = ["io-util", "io-std", "macros", "rt-multi-thread", "net"]
+
+[build-dependencies]
+cc = "1.0"
+

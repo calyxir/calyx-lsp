@@ -1,0 +1,3 @@
+[submodule "tree-sitter-calyx"]
+	path = tree-sitter-calyx
+	url = git@github.com:calyxir/tree-sitter-calyx.git
