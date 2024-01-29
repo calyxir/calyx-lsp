@@ -6,9 +6,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use document::Document;
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::{self as lspt, GotoDefinitionParams};
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp::lsp_types::{self as lspt, GotoDefinitionParams, GotoDefinitionResponse, Location};
+use tower_lsp::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tree_sitter::{Language, Parser, Point};
 
 use crate::log::Debug;
@@ -113,7 +112,10 @@ fn newline_split(data: &str) -> Vec<String> {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _ip: lspt::InitializeParams) -> Result<lspt::InitializeResult> {
+    async fn initialize(
+        &self,
+        _ip: lspt::InitializeParams,
+    ) -> jsonrpc::Result<lspt::InitializeResult> {
         Debug::log("stdout", "init");
         assert_eq!(newline_split("\n").len(), 2);
         Ok(lspt::InitializeResult {
@@ -151,7 +153,7 @@ impl LanguageServer for Backend {
         });
     }
 
-    async fn hover(&self, hover_params: lspt::HoverParams) -> Result<Option<lspt::Hover>> {
+    async fn hover(&self, hover_params: lspt::HoverParams) -> jsonrpc::Result<Option<lspt::Hover>> {
         let params = hover_params.text_document_position_params;
         Ok(self.read_document(&params.text_document.uri, |doc| {
             doc.thing_at_point(params.position.point())
@@ -190,12 +192,27 @@ impl LanguageServer for Backend {
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
-    ) -> Result<Option<lspt::GotoDefinitionResponse>> {
-        Debug::log("stdout", format!("{params:#?}"));
-        Ok(None)
+    ) -> jsonrpc::Result<Option<lspt::GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        Ok(self.read_document(uri, |doc| {
+            doc.thing_at_point(params.text_document_position_params.position.point())
+                .and_then(|thing| match thing {
+                    document::Things::Cell(node, name) => doc.cells_from(node, &name).map(|node| {
+                        GotoDefinitionResponse::Scalar(Location::new(
+                            uri.clone(),
+                            lspt::Range::new(
+                                node.range().start_point.position(),
+                                node.range().end_point.position(),
+                            ),
+                        ))
+                    }),
+                    document::Things::Port(..) => None,
+                    document::Things::Component(..) => None,
+                })
+        }))
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&self) -> jsonrpc::Result<()> {
         Ok(())
     }
 }
@@ -208,25 +225,3 @@ async fn main() {
     let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
 }
-
-// #[tokio::main]
-// async fn main() {
-//     tracing_subscriber::fmt().with_ansi(false).init();
-
-//     let listener = TcpListener::bind("127.0.0.1:9257").await.unwrap();
-//     println!("waiting for somebody to connect");
-//     let (stream, _) = listener.accept().await.unwrap();
-//     println!("connected! {stream:?}");
-
-//     let (read, write) = tokio::io::split(stream);
-
-//     // create the tree-sitter parser
-//     let language = unsafe { tree_sitter_calyx() };
-//     let mut parser = Parser::new();
-//     parser.set_language(language).unwrap();
-
-//     let (service, socket) = LspService::new(|client| Backend::new(client));
-//     println!("starting");
-//     Server::new(read, write, socket).serve(service).await;
-//     println!("done");
-// }

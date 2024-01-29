@@ -1,8 +1,12 @@
 //! Represents a single Calyx file
 
-use tree_sitter::{Node, Parser, Point, Tree};
+use std::collections::HashMap;
+
+use itertools::Itertools;
+use tree_sitter::{Node, Parser, Point, Query, QueryCursor, Tree};
 
 use crate::log::Debug;
+use crate::tree_sitter_calyx;
 use crate::ts_utils::ParentUntil;
 
 pub struct Document {
@@ -16,6 +20,7 @@ pub enum Things<'a> {
     /// Identifier referring to a port
     Port(Node<'a>, String),
     /// Identifier refeferring to a component
+    #[allow(unused)]
     Component(Node<'a>, String),
 }
 
@@ -39,10 +44,45 @@ impl Document {
         Debug::update("tree", self.tree.as_ref().unwrap().root_node().to_sexp())
     }
 
-    pub fn cells_at_point(&self, point: Point) {
-        self.node_at_point(point)
-            .and_then(|n| n.parent_until(|n| n.kind() == "component"))
-            .and_then(|comp| Some(()));
+    fn captures<'a, 'node: 'a>(
+        &'a self,
+        pattern: &str,
+        node: Node<'node>,
+    ) -> HashMap<String, Vec<Node>> {
+        let mut cursor = QueryCursor::new();
+        let query = Query::new(unsafe { tree_sitter_calyx() }, pattern).expect("Invalid query");
+        let capture_names = query.capture_names();
+        let mut map = HashMap::default();
+        for (capture, idx) in cursor.captures(&query, node, self.text.as_bytes()) {
+            Debug::log("stdout", format!("{idx} -> {capture:?}"));
+            let captured_nodes = capture.captures.iter().map(|c| c.node).collect_vec();
+            map.entry(capture_names[idx].to_string())
+                .and_modify(|e: &mut Vec<Node>| {
+                    e.extend(&captured_nodes);
+                })
+                .or_insert(captured_nodes);
+        }
+        map
+    }
+
+    pub fn cells_from<'a>(&'a self, node: Node<'a>, name: &str) -> Option<Node<'a>> {
+        node.parent_until(|n| n.kind() == "component")
+            .and_then(|comp| {
+                let comp_node = self.captures("(component) @comp", comp)["comp"][0];
+                let cells = &self.captures("(cell_assignment (ident) @cell)", comp_node)["cell"];
+                Debug::log(
+                    "stdout",
+                    format!(
+                        "{}",
+                        cells
+                            .iter()
+                            .map(|x| format!("{x:?}"))
+                            .collect_vec()
+                            .join(", ")
+                    ),
+                );
+                cells.iter().find(|n| self.node_text(n) == name).cloned()
+            })
     }
 
     pub fn node_at_point(&self, point: Point) -> Option<Node> {
