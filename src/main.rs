@@ -23,7 +23,7 @@ extern "C" {
     fn tree_sitter_calyx() -> ts::Language;
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct Config {
     #[serde(rename = "calyx-lsp")]
     calyx_lsp: CalyxLspConfig,
@@ -35,10 +35,18 @@ struct CalyxLspConfig {
     library_paths: Vec<String>,
 }
 
+impl Default for CalyxLspConfig {
+    fn default() -> Self {
+        Self {
+            library_paths: vec!["~/.calyx".to_string()],
+        }
+    }
+}
+
 struct Backend {
     client: Client,
     open_docs: RwLock<HashMap<lspt::Url, document::Document>>,
-    config: RwLock<Option<Config>>,
+    config: RwLock<Config>,
 }
 
 impl Backend {
@@ -46,7 +54,7 @@ impl Backend {
         Self {
             client,
             open_docs: RwLock::new(HashMap::default()),
-            config: RwLock::new(None),
+            config: RwLock::new(Config::default()),
         }
     }
 
@@ -98,12 +106,9 @@ impl Backend {
         cur_dir: PathBuf,
         imports: &'a [String],
     ) -> impl Iterator<Item = PathBuf> + 'a {
+        Debug::stdout(format!("{cur_dir:?} {imports:?}"));
         let config = self.config.read().unwrap();
-        let lib_paths = config
-            .iter()
-            .flat_map(|c| &c.calyx_lsp.library_paths)
-            .cloned()
-            .collect_vec();
+        let lib_paths = config.calyx_lsp.library_paths.clone();
         imports
             .iter()
             .cartesian_product(
@@ -132,6 +137,7 @@ fn newline_split(data: &str) -> Vec<String> {
     res
 }
 
+#[derive(Debug)]
 enum GotoDefResult<T> {
     Found(lspt::Location),
     ContinueSearch(Vec<PathBuf>, T),
@@ -171,8 +177,9 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_configuration(&self, params: lspt::DidChangeConfigurationParams) {
+        Debug::stdout(format!("{}", params.settings));
         let config: Config = serde_json::from_value(params.settings).unwrap();
-        *self.config.write().unwrap() = Some(config);
+        *self.config.write().unwrap() = config;
     }
 
     async fn did_change(&self, params: lspt::DidChangeTextDocumentParams) {
@@ -250,6 +257,7 @@ impl LanguageServer for Backend {
                     }
                 })
         });
+        Debug::stdout(format!("goto/def: {res:?}"));
         Ok(res.and_then(|gdr| match gdr {
             GotoDefResult::Found(loc) => Some(GotoDefinitionResponse::Scalar(loc)),
             GotoDefResult::ContinueSearch(paths, name) => {
@@ -282,7 +290,10 @@ impl LanguageServer for Backend {
                         GotoDefResult::ContinueSearch(paths, _) => queue.extend_from_slice(&paths),
                     }
                 }
-                found.map(|loc| GotoDefinitionResponse::Scalar(loc))
+                found.map(|loc| {
+                    Debug::stdout(format!("found {loc:?}"));
+                    GotoDefinitionResponse::Scalar(loc)
+                })
             }
         }))
     }
