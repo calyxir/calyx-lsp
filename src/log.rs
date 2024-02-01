@@ -9,7 +9,7 @@ impl Debug {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("/tmp/calyx-lsp-debug/{name}.log"))
+            .open(format!("/tmp/calyx-lsp-debug-{name}.log"))
             .unwrap();
         writeln!(file, "{}", msg.as_ref()).expect("Unable to write file");
     }
@@ -25,7 +25,7 @@ impl Debug {
             .create(true)
             .write(true)
             .truncate(true)
-            .open(format!("/tmp/calyx-lsp-debug/{name}.log"))
+            .open(format!("/tmp/calyx-lsp-debug-{name}.log"))
             .unwrap();
         writeln!(file, "{}", msg.as_ref()).expect("Unable to write file");
     }
