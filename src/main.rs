@@ -1,5 +1,6 @@
 mod convert;
 mod document;
+mod goto_definition;
 mod log;
 mod ts_utils;
 
@@ -8,12 +9,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use convert::Range;
 use document::Document;
+use goto_definition::{DefinitionProvider, DefinitionResult};
 use itertools::Itertools;
 use resolve_path::PathResolveExt;
 use serde::Deserialize;
-use tower_lsp::lsp_types::{self as lspt, GotoDefinitionParams, GotoDefinitionResponse, Location};
+use tower_lsp::lsp_types::{self as lspt, GotoDefinitionParams, GotoDefinitionResponse};
 use tower_lsp::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tree_sitter as ts;
 
@@ -99,26 +100,25 @@ impl Backend {
         let mut map = self.open_docs.write().unwrap();
         map.get_mut(uri).map(updater);
     }
+}
 
-    /// Not yet sure where this should live. I'll just plop it here.
-    fn resolve_imports<'a>(
-        &'a self,
-        cur_dir: PathBuf,
-        imports: &'a [String],
-    ) -> impl Iterator<Item = PathBuf> + 'a {
-        Debug::stdout(format!("{cur_dir:?} {imports:?}"));
-        let config = self.config.read().unwrap();
-        let lib_paths = config.calyx_lsp.library_paths.clone();
-        imports
-            .iter()
-            .cartesian_product(
-                vec![cur_dir]
-                    .into_iter()
-                    .chain(lib_paths.into_iter().map(|p| PathBuf::from(p))),
-            )
-            .map(|(base_path, lib_path)| lib_path.join(base_path).resolve().into_owned())
-            .filter(|p| p.exists())
-    }
+/// Not yet sure where this should live. I'll just plop it here.
+fn resolve_imports<'a>(
+    cur_dir: PathBuf,
+    lib_paths: &'a [String],
+    imports: &'a [String],
+) -> impl Iterator<Item = PathBuf> + 'a {
+    // let config = self.config.read().unwrap();
+    // let lib_paths = config.calyx_lsp.library_paths.clone();
+    imports
+        .iter()
+        .cartesian_product(
+            vec![cur_dir]
+                .into_iter()
+                .chain(lib_paths.into_iter().map(|p| PathBuf::from(p))),
+        )
+        .map(|(base_path, lib_path)| lib_path.join(base_path).resolve().into_owned())
+        .filter(|p| p.exists())
 }
 
 /// TODO: turn this into a trait
@@ -135,12 +135,6 @@ fn newline_split(data: &str) -> Vec<String> {
     }
     res.push(curr_string);
     res
-}
-
-#[derive(Debug)]
-enum GotoDefResult<T> {
-    Found(lspt::Location),
-    ContinueSearch(Vec<PathBuf>, T),
 }
 
 #[tower_lsp::async_trait]
@@ -194,111 +188,38 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> jsonrpc::Result<Option<lspt::GotoDefinitionResponse>> {
-        let uri = &params.text_document_position_params.text_document.uri;
-        let res: Option<GotoDefResult<String>> = self.read_document(uri, |doc| {
-            doc.thing_at_point(params.text_document_position_params.position.into())
-                .and_then(|thing| match thing {
-                    document::Things::Cell(node, name) => doc
-                        .enclosing_cells(node)
-                        .find(|n| doc.node_text(n) == name)
-                        .map(|node| {
-                            GotoDefResult::Found(Location::new(
-                                uri.clone(),
-                                Range::from(node).into(),
-                            ))
-                        }),
-                    document::Things::SelfPort(node, name) => doc
-                        .enclosing_component_ports(node)
-                        .find(|n| doc.node_text(n) == name)
-                        .map(|n| {
-                            GotoDefResult::Found(Location::new(uri.clone(), Range::from(n).into()))
-                        }),
-                    document::Things::Component(name) => doc
-                        .components()
-                        .find(|n| doc.node_text(n) == name)
-                        .map(|n| {
-                            GotoDefResult::Found(Location::new(uri.clone(), Range::from(n).into()))
-                        })
-                        .or_else(|| {
-                            Some(GotoDefResult::ContinueSearch(
-                                self.resolve_imports(
-                                    uri.to_file_path().unwrap().parent().unwrap().to_path_buf(),
-                                    &doc.imports(),
-                                )
-                                .collect(),
-                                name,
-                            ))
-                        }),
-                    document::Things::Group(node, name) => doc
-                        .enclosing_groups(node)
-                        .find(|g| doc.node_text(g) == name)
-                        .map(|node| {
-                            GotoDefResult::Found(Location::new(
-                                uri.clone(),
-                                Range::from(node).into(),
-                            ))
-                        }),
-                    document::Things::Import(_node, name) => {
-                        let paths = self
-                            .resolve_imports(
-                                uri.to_file_path().unwrap().parent().unwrap().to_path_buf(),
-                                &[name],
-                            )
-                            .collect_vec();
-                        if paths.len() > 0 {
-                            Some(GotoDefResult::Found(Location::new(
-                                lspt::Url::parse(&format!("file://{}", paths[0].display()))
-                                    .unwrap(),
-                                Range::zero().into(),
-                            )))
-                        } else {
-                            None
+        let url = &params.text_document_position_params.text_document.uri;
+        let config = &self.config.read().unwrap();
+        Ok(self
+            .read_document(url, |doc| {
+                doc.thing_at_point(params.text_document_position_params.position.into())
+                    .and_then(|thing| doc.find_thing(config, url.clone(), thing))
+            })
+            .and_then(|gdr| match gdr {
+                DefinitionResult::Found(loc) => Some(GotoDefinitionResponse::Scalar(loc)),
+                DefinitionResult::ContinueSearch(paths, name) => {
+                    let mut queue = paths;
+                    let mut found = None;
+                    while let Some(p) = queue.pop() {
+                        let url = lspt::Url::from_file_path(p.clone()).unwrap();
+                        let res = self.read_and_open(url.clone(), |doc| {
+                            doc.find_component(config, url.clone(), name.to_string())
+                        });
+                        match res {
+                            Some(DefinitionResult::Found(loc)) => found = Some(loc),
+                            Some(DefinitionResult::ContinueSearch(paths, _)) => {
+                                queue.extend_from_slice(&paths)
+                            }
+                            None => (),
                         }
                     }
-                })
-        });
-        Debug::stdout(format!("goto/def: {res:?}"));
-        Ok(res.and_then(|gdr| match gdr {
-            GotoDefResult::Found(loc) => Some(GotoDefinitionResponse::Scalar(loc)),
-            GotoDefResult::ContinueSearch(paths, name) => {
-                let mut queue = paths;
-                let mut found = None;
-                while let Some(p) = queue.pop() {
-                    let res =
-                        self.read_and_open(lspt::Url::from_file_path(p.clone()).unwrap(), |doc| {
-                            doc.components()
-                                .find(|n| doc.node_text(n) == name)
-                                .map(|n| {
-                                    GotoDefResult::Found(Location::new(
-                                        lspt::Url::from_file_path(p.clone()).unwrap(),
-                                        Range::from(n).into(),
-                                    ))
-                                })
-                                .or_else(|| {
-                                    Some(GotoDefResult::ContinueSearch(
-                                        self.resolve_imports(
-                                            p.parent().unwrap().to_path_buf(),
-                                            &doc.imports(),
-                                        )
-                                        .collect(),
-                                        name.to_string(),
-                                    ))
-                                })
-                        });
-                    match res.unwrap() {
-                        GotoDefResult::Found(loc) => found = Some(loc),
-                        GotoDefResult::ContinueSearch(paths, _) => queue.extend_from_slice(&paths),
-                    }
+                    found.map(|loc| GotoDefinitionResponse::Scalar(loc))
                 }
-                found.map(|loc| {
-                    Debug::stdout(format!("found {loc:?}"));
-                    GotoDefinitionResponse::Scalar(loc)
-                })
-            }
-        }))
+            }))
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
+        Debug::stdout("shutdown");
         Ok(())
     }
 }
