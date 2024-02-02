@@ -9,7 +9,20 @@ use tree_sitter as ts;
 #[derive(Clone)]
 pub struct Point(ts::Point);
 
+#[allow(unused)]
 impl Point {
+    pub fn row(&self) -> usize {
+        self.0.row
+    }
+
+    pub fn column(&self) -> usize {
+        self.0.column
+    }
+
+    pub fn new(row: usize, column: usize) -> Self {
+        Self(ts::Point { row, column })
+    }
+
     pub fn zero() -> Self {
         Self(ts::Point { row: 0, column: 0 })
     }

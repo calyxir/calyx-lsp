@@ -9,12 +9,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+use convert::Point;
 use document::Document;
 use goto_definition::{DefinitionProvider, DefinitionResult};
 use itertools::Itertools;
 use resolve_path::PathResolveExt;
 use serde::Deserialize;
-use tower_lsp::lsp_types::{self as lspt, GotoDefinitionParams, GotoDefinitionResponse};
+use tower_lsp::lsp_types as lspt;
 use tower_lsp::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tree_sitter as ts;
 
@@ -108,8 +109,6 @@ fn resolve_imports<'a>(
     lib_paths: &'a [String],
     imports: &'a [String],
 ) -> impl Iterator<Item = PathBuf> + 'a {
-    // let config = self.config.read().unwrap();
-    // let lib_paths = config.calyx_lsp.library_paths.clone();
     imports
         .iter()
         .cartesian_product(
@@ -153,6 +152,13 @@ impl LanguageServer for Backend {
                     lspt::TextDocumentSyncKind::FULL,
                 )),
                 definition_provider: Some(lspt::OneOf::Left(true)),
+                completion_provider: Some(lspt::CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: Some(vec![".".to_string()]),
+                    all_commit_characters: None,
+                    work_done_progress_options: Default::default(),
+                    completion_item: None,
+                }),
                 hover_provider: None,
                 ..Default::default()
             },
@@ -186,7 +192,7 @@ impl LanguageServer for Backend {
 
     async fn goto_definition(
         &self,
-        params: GotoDefinitionParams,
+        params: lspt::GotoDefinitionParams,
     ) -> jsonrpc::Result<Option<lspt::GotoDefinitionResponse>> {
         let url = &params.text_document_position_params.text_document.uri;
         let config = &self.config.read().unwrap();
@@ -196,7 +202,7 @@ impl LanguageServer for Backend {
                     .and_then(|thing| doc.find_thing(config, url.clone(), thing))
             })
             .and_then(|gdr| match gdr {
-                DefinitionResult::Found(loc) => Some(GotoDefinitionResponse::Scalar(loc)),
+                DefinitionResult::Found(loc) => Some(lspt::GotoDefinitionResponse::Scalar(loc)),
                 DefinitionResult::ContinueSearch(paths, name) => {
                     let mut queue = paths;
                     let mut found = None;
@@ -213,9 +219,26 @@ impl LanguageServer for Backend {
                             None => (),
                         }
                     }
-                    found.map(|loc| GotoDefinitionResponse::Scalar(loc))
+                    found.map(|loc| lspt::GotoDefinitionResponse::Scalar(loc))
                 }
             }))
+    }
+
+    async fn completion(
+        &self,
+        params: lspt::CompletionParams,
+    ) -> jsonrpc::Result<Option<lspt::CompletionResponse>> {
+        Debug::stdout(format!("completion: {params:#?}"));
+        let url = &params.text_document_position.text_document.uri;
+        let point: Point = params.text_document_position.position.into();
+        Ok(self.read_document(url, |doc| {
+            Some(lspt::CompletionResponse::Array(
+                doc.completion_at_point(point.clone())
+                    .into_iter()
+                    .map(|(name, descr)| lspt::CompletionItem::new_simple(name, descr))
+                    .collect(),
+            ))
+        }))
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
