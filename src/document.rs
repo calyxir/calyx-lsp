@@ -1,30 +1,43 @@
 //! Represents a single Calyx file
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use itertools::{multizip, Itertools};
 use regex::Regex;
+use resolve_path::PathResolveExt;
+use tower_lsp::lsp_types as lspt;
 use tree_sitter as ts;
 
 use crate::convert::{Point, Range};
+use crate::goto_definition::QueryResult;
 use crate::log::Debug;
-use crate::tree_sitter_calyx;
 use crate::ts_utils::ParentUntil;
+use crate::{tree_sitter_calyx, Config};
 
 pub struct Document {
+    pub url: lspt::Url,
     text: String,
     tree: Option<ts::Tree>,
     parser: ts::Parser,
     /// Map the stores information about every component defined in this file.
-    components: HashMap<String, ComponentInfo>,
+    components: HashMap<String, PrivateComponentInfo>,
 }
 
+/// File-private information about each component
 #[derive(Debug)]
-pub struct ComponentInfo {
+struct PrivateComponentInfo {
     inputs: Vec<String>,
     outputs: Vec<String>,
     cells: HashMap<String, String>,
     groups: Vec<String>,
+}
+
+/// Public information about a component
+#[derive(Debug)]
+pub struct ComponentSig {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,10 +72,11 @@ pub trait NodeRangesIter<'a>: Iterator<Item = ts::Node<'a>> + Sized {
 }
 
 impl Document {
-    pub fn new() -> Self {
+    pub fn new(url: lspt::Url) -> Self {
         let mut parser = ts::Parser::new();
         parser.set_language(unsafe { tree_sitter_calyx() }).unwrap();
         Self {
+            url,
             text: String::new(),
             tree: None,
             parser,
@@ -70,8 +84,8 @@ impl Document {
         }
     }
 
-    pub fn new_with_text(text: &str) -> Self {
-        let mut doc = Self::new();
+    pub fn new_with_text(url: lspt::Url, text: &str) -> Self {
+        let mut doc = Self::new(url);
         doc.parse_whole_text(text);
         doc
     }
@@ -144,7 +158,7 @@ impl Document {
                 .map(|(comp, inputs, outputs, cells, wires)| {
                     (
                         self.node_text(comp).to_string(),
-                        ComponentInfo {
+                        PrivateComponentInfo {
                             inputs: self.captures(*inputs, "(ident) @id")["id"]
                                 .iter()
                                 .map(|n| self.node_text(n).to_string())
@@ -227,9 +241,7 @@ impl Document {
     }
 
     /// Return the list of imported files
-    #[allow(unused)]
-    pub fn imports(&self) -> Vec<String> {
-        self.components();
+    pub fn raw_imports(&self) -> Vec<String> {
         self.tree
             .as_ref()
             .iter()
@@ -237,6 +249,65 @@ impl Document {
             // the nodes have quotes in them, so we have to remove them
             .map(|n| self.node_text(&n).to_string().replace('"', ""))
             .collect()
+    }
+
+    pub fn resolved_imports<'a>(
+        &'a self,
+        config: &'a Config,
+    ) -> impl Iterator<Item = PathBuf> + 'a {
+        let lib_paths = &config.calyx_lsp.library_paths;
+        let cur_dir = self
+            .url
+            .to_file_path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        self.raw_imports()
+            .into_iter()
+            .cartesian_product(
+                vec![cur_dir]
+                    .into_iter()
+                    .chain(lib_paths.into_iter().map(|p| PathBuf::from(p))),
+            )
+            .map(|(base_path, lib_path)| lib_path.join(base_path).resolve().into_owned())
+            .filter(|p| p.exists())
+    }
+
+    pub fn signatures(&self) -> impl Iterator<Item = (String, ComponentSig)> + '_ {
+        Debug::stdout("signatures");
+        self.components()
+            .filter_map(|comp_node| {
+                comp_node
+                    .parent_until_names(&["component", "primitive"])
+                    .map(|p| (p, self.node_text(&comp_node)))
+            })
+            .flat_map(move |(comp_node, name)| {
+                let mut map = self.captures(
+                    comp_node,
+                    "(signature (io_port_list) @inputs (io_port_list) @outputs)",
+                );
+                multizip((
+                    map.remove("inputs").unwrap().into_iter(),
+                    map.remove("outputs").unwrap().into_iter(),
+                ))
+                .map(move |(inputs, outputs)| {
+                    (
+                        name.to_string(),
+                        ComponentSig {
+                            inputs: self.captures(inputs, "(io_port (ident) @id . (_))")["id"]
+                                .iter()
+                                .map(|n| self.node_text(n).to_string())
+                                .collect(),
+                            outputs: self.captures(outputs, "(io_port (ident) @id . (_))")["id"]
+                                .iter()
+                                .map(|n| self.node_text(n).to_string())
+                                .collect(),
+                        },
+                    )
+                })
+                .inspect(|x| Debug::stdout(format!("something? {x:?}")))
+            })
     }
 
     pub fn node_at_point(&self, point: &Point) -> Option<ts::Node> {
@@ -296,15 +367,15 @@ impl Document {
     pub fn context_at_point(&self, point: &Point) -> Context {
         self.node_at_point(&point)
             .map(|node| {
-                if node.parent_until_name("cells").is_some() {
+                if node.parent_until_names(&["cells"]).is_some() {
                     Context::Cells
-                } else if node.parent_until_name("group").is_some() {
+                } else if node.parent_until_names(&["group"]).is_some() {
                     Context::Group
-                } else if node.parent_until_name("wires").is_some() {
+                } else if node.parent_until_names(&["wires"]).is_some() {
                     Context::Wires
-                } else if node.parent_until_name("control").is_some() {
+                } else if node.parent_until_names(&["control"]).is_some() {
                     Context::Control
-                } else if node.parent_until_name("component").is_some() {
+                } else if node.parent_until_names(&["component"]).is_some() {
                     Context::Component
                 } else {
                     Context::Toplevel
@@ -316,13 +387,21 @@ impl Document {
     fn last_word_from_point(&self, point: &Point) -> Option<String> {
         let re = Regex::new(r"\b\w+\b").unwrap();
         self.text.lines().nth(point.row()).and_then(|cur_line| {
-            let rev_line = cur_line.chars().rev().collect::<String>();
+            let rev_line = cur_line[0..point.column()]
+                .chars()
+                .rev()
+                .collect::<String>();
             re.find(&rev_line)
                 .map(|m| m.as_str().chars().rev().collect::<String>())
         })
     }
 
-    pub fn completion_at_point(&self, point: Point) -> Vec<(String, String)> {
+    // TODO: split this up into multiple sections
+    pub fn completion_at_point(
+        &self,
+        config: &Config,
+        point: Point,
+    ) -> QueryResult<Vec<(String, String)>, String> {
         self.last_word_from_point(&point)
             .and_then(|word| {
                 Debug::stdout(format!("completing: {word}"));
@@ -331,42 +410,54 @@ impl Document {
                     Debug::stdout(format!("context: {context:?}"));
                     match self.context_at_point(&point) {
                         Context::Toplevel => None,
-                        Context::Component | Context::Cells => Some(
+                        Context::Component | Context::Cells => Some(QueryResult::Found(
                             self.components
                                 .keys()
                                 .map(|k| (k.to_string(), "component".to_string()))
                                 .collect(),
-                        ),
-                        Context::Group => self
-                            .enclosing_component_name(node)
-                            .and_then(|comp_name| self.components.get(&comp_name))
-                            .and_then(|ci| ci.cells.get(&word))
-                            .and_then(|cell_name| self.components.get(cell_name))
-                            .map(|ci| {
-                                ci.inputs
-                                    .iter()
-                                    .map(|i| (i.to_string(), "input".to_string()))
-                                    .chain(
-                                        ci.outputs
-                                            .iter()
-                                            .map(|o| (o.to_string(), "output".to_string())),
-                                    )
-                                    .collect()
-                            }),
+                        )),
+                        Context::Group => {
+                            self.enclosing_component_name(node)
+                                .and_then(|comp_name| self.components.get(&comp_name))
+                                .and_then(|ci| ci.cells.get(&word))
+                                .and_then(|cell_name| {
+                                    self.components
+                                        .get(cell_name)
+                                        .map(|ci| {
+                                            QueryResult::Found(
+                                                ci.inputs
+                                                    .iter()
+                                                    .map(|i| (i.to_string(), "input".to_string()))
+                                                    .chain(ci.outputs.iter().map(|o| {
+                                                        (o.to_string(), "output".to_string())
+                                                    }))
+                                                    .collect(),
+                                            )
+                                        })
+                                        .or_else(|| {
+                                            Some(QueryResult::ContinueSearch(
+                                                self.resolved_imports(config).collect(),
+                                                cell_name.to_string(),
+                                            ))
+                                        })
+                                })
+                        }
                         Context::Wires => None,
                         Context::Control => self
                             .enclosing_component_name(node)
                             .and_then(|comp_name| self.components.get(&comp_name))
                             .map(|ci| {
-                                ci.groups
-                                    .iter()
-                                    .map(|g| (g.to_string(), "group".to_string()))
-                                    .collect()
+                                QueryResult::Found(
+                                    ci.groups
+                                        .iter()
+                                        .map(|g| (g.to_string(), "group".to_string()))
+                                        .collect(),
+                                )
                             }),
                     }
                 })
             })
-            .unwrap_or(vec![])
+            .unwrap_or(QueryResult::Found(vec![]))
     }
 
     pub fn node_text(&self, node: &ts::Node) -> &str {

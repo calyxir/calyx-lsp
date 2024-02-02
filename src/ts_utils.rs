@@ -5,7 +5,7 @@ pub trait ParentUntil: Sized {
     where
         F: Fn(&Self) -> bool;
 
-    fn parent_until_name<S>(&self, name: S) -> Option<Self>
+    fn parent_until_names<S>(&self, names: &[S]) -> Option<Self>
     where
         S: AsRef<str>;
 }
@@ -24,10 +24,10 @@ impl ParentUntil for Node<'_> {
         })
     }
 
-    fn parent_until_name<S>(&self, name: S) -> Option<Self>
+    fn parent_until_names<S>(&self, names: &[S]) -> Option<Self>
     where
         S: AsRef<str>,
     {
-        self.parent_until(|p| p.kind() == name.as_ref())
+        self.parent_until(|p| names.iter().find(|n| p.kind() == n.as_ref()).is_some())
     }
 }

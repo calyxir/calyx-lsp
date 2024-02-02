@@ -6,14 +6,11 @@ mod ts_utils;
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::RwLock;
 
 use convert::Point;
-use document::Document;
-use goto_definition::{DefinitionProvider, DefinitionResult};
-use itertools::Itertools;
-use resolve_path::PathResolveExt;
+use document::{ComponentSig, Document};
+use goto_definition::{DefinitionProvider, QueryResult};
 use serde::Deserialize;
 use tower_lsp::lsp_types as lspt;
 use tower_lsp::{jsonrpc, Client, LanguageServer, LspService, Server};
@@ -49,6 +46,8 @@ struct Backend {
     client: Client,
     open_docs: RwLock<HashMap<lspt::Url, document::Document>>,
     config: RwLock<Config>,
+    /// A map from each open file, to the components defined in that file
+    symbols: RwLock<HashMap<lspt::Url, HashMap<String, ComponentSig>>>,
 }
 
 impl Backend {
@@ -57,12 +56,19 @@ impl Backend {
             client,
             open_docs: RwLock::new(HashMap::default()),
             config: RwLock::new(Config::default()),
+            symbols: RwLock::new(HashMap::default()),
         }
     }
 
     fn open(&self, uri: lspt::Url, text: String) {
         let mut map = self.open_docs.write().unwrap();
-        map.insert(uri, Document::new_with_text(&text));
+        map.insert(uri.clone(), Document::new_with_text(uri, &text));
+    }
+
+    fn open_path(&self, uri: lspt::Url) {
+        fs::read_to_string(uri.to_file_path().unwrap())
+            .ok()
+            .map(|text| self.open(uri.clone(), text));
     }
 
     fn exists(&self, uri: &lspt::Url) -> bool {
@@ -72,23 +78,20 @@ impl Backend {
 
     fn read_document<F, T>(&self, uri: &lspt::Url, reader: F) -> Option<T>
     where
-        F: Fn(&Document) -> Option<T>,
+        F: FnMut(&Document) -> Option<T>,
     {
         let map = self.open_docs.read().unwrap();
         map.get(uri).and_then(reader)
     }
 
-    fn read_and_open<F, T>(&self, uri: lspt::Url, reader: F) -> Option<T>
+    fn read_and_open<F, T>(&self, uri: &lspt::Url, reader: F) -> Option<T>
     where
-        F: Fn(&Document) -> Option<T>,
+        F: FnMut(&Document) -> Option<T>,
     {
         // if the file doesnt exist, read it's contents and create a doc for it
         if !self.exists(&uri) {
-            fs::read_to_string(uri.to_file_path().unwrap())
-                .ok()
-                .map(|text| {
-                    self.open(uri.clone(), text);
-                });
+            self.open_path(uri.clone());
+            self.update_symbols(&uri);
         }
 
         self.read_document(&uri, reader)
@@ -101,24 +104,52 @@ impl Backend {
         let mut map = self.open_docs.write().unwrap();
         map.get_mut(uri).map(updater);
     }
+
+    fn update_symbols(&self, url: &lspt::Url) {
+        self.symbols
+            .write()
+            .unwrap()
+            .entry(url.clone())
+            .and_modify(|map| {
+                self.read_document(url, |doc| {
+                    for (name, sig) in doc.signatures() {
+                        map.insert(name, sig);
+                    }
+                    Some(())
+                });
+            })
+            .or_insert_with(|| {
+                self.read_document(url, |doc| Some(doc.signatures().collect()))
+                    .unwrap()
+            });
+        Debug::stdout(format!(
+            "symbols: {:#?}",
+            self.symbols
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect::<Vec<_>>()
+        ));
+    }
 }
 
-/// Not yet sure where this should live. I'll just plop it here.
-fn resolve_imports<'a>(
-    cur_dir: PathBuf,
-    lib_paths: &'a [String],
-    imports: &'a [String],
-) -> impl Iterator<Item = PathBuf> + 'a {
-    imports
-        .iter()
-        .cartesian_product(
-            vec![cur_dir]
-                .into_iter()
-                .chain(lib_paths.into_iter().map(|p| PathBuf::from(p))),
-        )
-        .map(|(base_path, lib_path)| lib_path.join(base_path).resolve().into_owned())
-        .filter(|p| p.exists())
-}
+// /// Not yet sure where this should live. I'll just plop it here.
+// fn resolve_imports<'a>(
+//     cur_dir: PathBuf,
+//     lib_paths: &'a [String],
+//     imports: &'a [String],
+// ) -> impl Iterator<Item = PathBuf> + 'a {
+//     imports
+//         .iter()
+//         .cartesian_product(
+//             vec![cur_dir]
+//                 .into_iter()
+//                 .chain(lib_paths.into_iter().map(|p| PathBuf::from(p))),
+//         )
+//         .map(|(base_path, lib_path)| lib_path.join(base_path).resolve().into_owned())
+//         .filter(|p| p.exists())
+// }
 
 /// TODO: turn this into a trait
 fn newline_split(data: &str) -> Vec<String> {
@@ -188,6 +219,7 @@ impl LanguageServer for Backend {
                 doc.parse_whole_text(&event.text);
             }
         });
+        self.update_symbols(&params.text_document.uri);
     }
 
     async fn goto_definition(
@@ -202,18 +234,18 @@ impl LanguageServer for Backend {
                     .and_then(|thing| doc.find_thing(config, url.clone(), thing))
             })
             .and_then(|gdr| match gdr {
-                DefinitionResult::Found(loc) => Some(lspt::GotoDefinitionResponse::Scalar(loc)),
-                DefinitionResult::ContinueSearch(paths, name) => {
+                QueryResult::Found(loc) => Some(lspt::GotoDefinitionResponse::Scalar(loc)),
+                QueryResult::ContinueSearch(paths, name) => {
                     let mut queue = paths;
                     let mut found = None;
                     while let Some(p) = queue.pop() {
                         let url = lspt::Url::from_file_path(p.clone()).unwrap();
-                        let res = self.read_and_open(url.clone(), |doc| {
-                            doc.find_component(config, url.clone(), name.to_string())
+                        let res = self.read_and_open(&url, |doc| {
+                            doc.find_component(config, name.to_string())
                         });
                         match res {
-                            Some(DefinitionResult::Found(loc)) => found = Some(loc),
-                            Some(DefinitionResult::ContinueSearch(paths, _)) => {
+                            Some(QueryResult::Found(loc)) => found = Some(loc),
+                            Some(QueryResult::ContinueSearch(paths, _)) => {
                                 queue.extend_from_slice(&paths)
                             }
                             None => (),
@@ -228,17 +260,63 @@ impl LanguageServer for Backend {
         &self,
         params: lspt::CompletionParams,
     ) -> jsonrpc::Result<Option<lspt::CompletionResponse>> {
-        Debug::stdout(format!("completion: {params:#?}"));
         let url = &params.text_document_position.text_document.uri;
         let point: Point = params.text_document_position.position.into();
-        Ok(self.read_document(url, |doc| {
-            Some(lspt::CompletionResponse::Array(
-                doc.completion_at_point(point.clone())
-                    .into_iter()
-                    .map(|(name, descr)| lspt::CompletionItem::new_simple(name, descr))
-                    .collect(),
-            ))
-        }))
+        let config = self.config.read().unwrap();
+        Ok(self
+            .read_document(url, |doc| {
+                Some(doc.completion_at_point(&config, point.clone()))
+            })
+            .and_then(|res| match res {
+                QueryResult::Found(results) => Some(lspt::CompletionResponse::Array(
+                    results
+                        .into_iter()
+                        .map(|(name, descr)| lspt::CompletionItem::new_simple(name, descr))
+                        .collect(),
+                )),
+                QueryResult::ContinueSearch(paths, data) => {
+                    Debug::stdout(format!("looking for {data} in {paths:?}"));
+                    // open all paths recursively
+                    let mut queue = paths;
+                    let mut found = None;
+                    while let Some(p) = queue.pop() {
+                        Debug::stdout(format!("checking {p:?}"));
+                        let url = lspt::Url::from_file_path(p.clone()).unwrap();
+                        if !self.exists(&url) {
+                            self.read_and_open(&url, |doc| {
+                                queue.extend(doc.resolved_imports(&config));
+                                Debug::stdout(format!("queue: {queue:?}"));
+                                Some(())
+                            });
+                        }
+                        self.update_symbols(&url);
+                        if let Some(blah) = self
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .get(&url)
+                            .and_then(|map| map.get(&data))
+                        {
+                            found = Some(lspt::CompletionResponse::Array(
+                                blah.inputs
+                                    .iter()
+                                    .map(|inp| (inp, "input"))
+                                    .chain(blah.outputs.iter().map(|out| (out, "output")))
+                                    .map(|(name, descr)| {
+                                        lspt::CompletionItem::new_simple(
+                                            name.to_string(),
+                                            descr.to_string(),
+                                        )
+                                    })
+                                    .collect(),
+                            ));
+                            Debug::stdout("breaking");
+                            break;
+                        }
+                    }
+                    found
+                }
+            }))
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {

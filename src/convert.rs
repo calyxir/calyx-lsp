@@ -61,6 +61,7 @@ pub struct Range {
     end: Point,
 }
 
+#[allow(unused)]
 impl Range {
     pub fn zero() -> Self {
         Self {
