@@ -6,7 +6,7 @@ use tower_lsp::lsp_types as lspt;
 use tree_sitter as ts;
 
 /// Crate local Point representing a location in a document
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Point(ts::Point);
 
 #[allow(unused)]
@@ -55,7 +55,20 @@ impl From<lspt::Position> for Point {
     }
 }
 
+impl PartialOrd<Point> for Point {
+    fn partial_cmp(&self, other: &Point) -> Option<std::cmp::Ordering> {
+        if self.row() < other.row() {
+            Some(std::cmp::Ordering::Less)
+        } else if self.row() == other.row() {
+            self.column().partial_cmp(&other.column())
+        } else {
+            Some(std::cmp::Ordering::Greater)
+        }
+    }
+}
+
 /// Crate local Range representing a region between two points
+#[derive(Debug)]
 pub struct Range {
     start: Point,
     end: Point,
@@ -101,5 +114,21 @@ impl From<ts::Range> for Range {
             start: value.start_point.into(),
             end: value.end_point.into(),
         }
+    }
+}
+
+pub trait Contains<T> {
+    fn contains(&self, other: T) -> bool;
+}
+
+impl Contains<&Point> for Range {
+    fn contains(&self, other: &Point) -> bool {
+        &self.start <= other && other < &self.end
+    }
+}
+
+impl<'a> Contains<&Point> for Vec<ts::Node<'a>> {
+    fn contains(&self, other: &Point) -> bool {
+        self.iter().any(|n| Range::from(*n).contains(other))
     }
 }

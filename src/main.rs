@@ -122,15 +122,6 @@ impl Backend {
                 self.read_document(url, |doc| Some(doc.signatures().collect()))
                     .unwrap()
             });
-        Debug::stdout(format!(
-            "symbols: {:#?}",
-            self.symbols
-                .read()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| (k.as_str(), v))
-                .collect::<Vec<_>>()
-        ));
     }
 }
 
@@ -173,7 +164,7 @@ impl LanguageServer for Backend {
         &self,
         _ip: lspt::InitializeParams,
     ) -> jsonrpc::Result<lspt::InitializeResult> {
-        Debug::log("stdout", "init");
+        Debug::init("init");
         assert_eq!(newline_split("\n").len(), 2);
         Ok(lspt::InitializeResult {
             server_info: None,
@@ -185,12 +176,12 @@ impl LanguageServer for Backend {
                 definition_provider: Some(lspt::OneOf::Left(true)),
                 completion_provider: Some(lspt::CompletionOptions {
                     resolve_provider: Some(false),
-                    trigger_characters: Some(vec![".".to_string()]),
+                    trigger_characters: Some(vec![".".to_string(), "[".to_string()]),
                     all_commit_characters: None,
                     work_done_progress_options: Default::default(),
                     completion_item: None,
                 }),
-                hover_provider: None,
+                hover_provider: Some(lspt::HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -208,7 +199,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_configuration(&self, params: lspt::DidChangeConfigurationParams) {
-        Debug::stdout(format!("{}", params.settings));
+        log::stdout!("{}", params.settings);
         let config: Config = serde_json::from_value(params.settings).unwrap();
         *self.config.write().unwrap() = config;
     }
@@ -220,6 +211,20 @@ impl LanguageServer for Backend {
             }
         });
         self.update_symbols(&params.text_document.uri);
+    }
+
+    async fn hover(&self, params: lspt::HoverParams) -> jsonrpc::Result<Option<lspt::Hover>> {
+        let url = params.text_document_position_params.text_document.uri;
+        let point: Point = params.text_document_position_params.position.into();
+        Ok(self.read_document(&url, |doc| {
+            let ctx = doc.context_at_point(&point);
+            Some(lspt::Hover {
+                contents: lspt::HoverContents::Scalar(lspt::MarkedString::String(format!(
+                    "{ctx:?}"
+                ))),
+                range: None,
+            })
+        }))
     }
 
     async fn goto_definition(
@@ -262,10 +267,11 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<lspt::CompletionResponse>> {
         let url = &params.text_document_position.text_document.uri;
         let point: Point = params.text_document_position.position.into();
+        let trigger_char = params.context.and_then(|cc| cc.trigger_character);
         let config = self.config.read().unwrap();
         Ok(self
             .read_document(url, |doc| {
-                Some(doc.completion_at_point(&config, point.clone()))
+                Some(doc.completion_at_point(&config, point.clone(), trigger_char.clone()))
             })
             .and_then(|res| match res {
                 QueryResult::Found(results) => Some(lspt::CompletionResponse::Array(
@@ -275,22 +281,24 @@ impl LanguageServer for Backend {
                         .collect(),
                 )),
                 QueryResult::ContinueSearch(paths, data) => {
-                    Debug::stdout(format!("looking for {data} in {paths:?}"));
                     // open all paths recursively
                     let mut queue = paths;
                     let mut found = None;
                     while let Some(p) = queue.pop() {
-                        Debug::stdout(format!("checking {p:?}"));
                         let url = lspt::Url::from_file_path(p.clone()).unwrap();
                         if !self.exists(&url) {
                             self.read_and_open(&url, |doc| {
                                 queue.extend(doc.resolved_imports(&config));
-                                Debug::stdout(format!("queue: {queue:?}"));
+                                Some(())
+                            });
+                        } else {
+                            self.read_document(&url, |doc| {
+                                queue.extend(doc.resolved_imports(&config));
                                 Some(())
                             });
                         }
                         self.update_symbols(&url);
-                        if let Some(blah) = self
+                        if let Some(sig) = self
                             .symbols
                             .read()
                             .unwrap()
@@ -298,10 +306,10 @@ impl LanguageServer for Backend {
                             .and_then(|map| map.get(&data))
                         {
                             found = Some(lspt::CompletionResponse::Array(
-                                blah.inputs
+                                sig.inputs
                                     .iter()
                                     .map(|inp| (inp, "input"))
-                                    .chain(blah.outputs.iter().map(|out| (out, "output")))
+                                    .chain(sig.outputs.iter().map(|out| (out, "output")))
                                     .map(|(name, descr)| {
                                         lspt::CompletionItem::new_simple(
                                             name.to_string(),
@@ -310,7 +318,6 @@ impl LanguageServer for Backend {
                                     })
                                     .collect(),
                             ));
-                            Debug::stdout("breaking");
                             break;
                         }
                     }

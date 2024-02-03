@@ -9,9 +9,9 @@ use resolve_path::PathResolveExt;
 use tower_lsp::lsp_types as lspt;
 use tree_sitter as ts;
 
-use crate::convert::{Point, Range};
+use crate::convert::{Contains, Point, Range};
 use crate::goto_definition::QueryResult;
-use crate::log::Debug;
+use crate::log::{self, Debug};
 use crate::ts_utils::ParentUntil;
 use crate::{tree_sitter_calyx, Config};
 
@@ -94,7 +94,7 @@ impl Document {
         self.text = text.to_string();
         self.tree = self.parser.parse(text, None);
         self.update_component_map();
-        Debug::update("tree", self.tree.as_ref().unwrap().root_node().to_sexp())
+        log::Debug::update("tree", self.tree.as_ref().unwrap().root_node().to_sexp())
     }
 
     fn root_node(&self) -> Option<ts::Node> {
@@ -110,7 +110,8 @@ impl Document {
         let mut cursor = ts::QueryCursor::new();
         // create the query from the passed in pattern
         let lang = unsafe { tree_sitter_calyx() };
-        let query = ts::Query::new(lang, pattern).expect("Invalid query");
+        let query = ts::Query::new(lang, pattern)
+            .unwrap_or_else(|err| panic!("Invalid Query:\n{}", err.message));
         // grab the @ capture names so that we can map idxes back to names
         let capture_names = query.capture_names();
 
@@ -275,7 +276,6 @@ impl Document {
     }
 
     pub fn signatures(&self) -> impl Iterator<Item = (String, ComponentSig)> + '_ {
-        Debug::stdout("signatures");
         self.components()
             .filter_map(|comp_node| {
                 comp_node
@@ -306,7 +306,6 @@ impl Document {
                         },
                     )
                 })
-                .inspect(|x| Debug::stdout(format!("something? {x:?}")))
             })
     }
 
@@ -366,16 +365,27 @@ impl Document {
 
     pub fn context_at_point(&self, point: &Point) -> Context {
         self.node_at_point(&point)
-            .map(|node| {
-                if node.parent_until_names(&["cells"]).is_some() {
+            .and_then(|n| {
+                if n.kind() == "component" {
+                    Some(n)
+                } else {
+                    n.parent_until_names(&["component"])
+                }
+            })
+            .map(|comp| {
+                let map = self.captures(
+                    comp,
+                    "(cells) @cells (wires (wires_inner (group) @group)) @wires (control) @control",
+                );
+                if map["cells"].contains(point) {
                     Context::Cells
-                } else if node.parent_until_names(&["group"]).is_some() {
+                } else if map["group"].contains(point) {
                     Context::Group
-                } else if node.parent_until_names(&["wires"]).is_some() {
+                } else if map["wires"].contains(point) {
                     Context::Wires
-                } else if node.parent_until_names(&["control"]).is_some() {
+                } else if map["control"].contains(point) {
                     Context::Control
-                } else if node.parent_until_names(&["component"]).is_some() {
+                } else if Range::from(comp).contains(point) {
                     Context::Component
                 } else {
                     Context::Toplevel
@@ -401,22 +411,22 @@ impl Document {
         &self,
         config: &Config,
         point: Point,
+        trigger_char: Option<String>,
     ) -> QueryResult<Vec<(String, String)>, String> {
         self.last_word_from_point(&point)
             .and_then(|word| {
-                Debug::stdout(format!("completing: {word}"));
+                log::stdout!("completing: {word}");
                 self.node_at_point(&point).and_then(|node| {
-                    let context = self.context_at_point(&point);
-                    Debug::stdout(format!("context: {context:?}"));
-                    match self.context_at_point(&point) {
-                        Context::Toplevel => None,
-                        Context::Component | Context::Cells => Some(QueryResult::Found(
+                    match (self.context_at_point(&point), trigger_char.as_deref()) {
+                        (Context::Toplevel, _) => None,
+                        (Context::Component, _) => None,
+                        (Context::Cells, _) => Some(QueryResult::Found(
                             self.components
                                 .keys()
                                 .map(|k| (k.to_string(), "component".to_string()))
                                 .collect(),
                         )),
-                        Context::Group => {
+                        (Context::Group, Some(".")) | (Context::Wires, Some(".")) => {
                             self.enclosing_component_name(node)
                                 .and_then(|comp_name| self.components.get(&comp_name))
                                 .and_then(|ci| ci.cells.get(&word))
@@ -442,8 +452,37 @@ impl Document {
                                         })
                                 })
                         }
-                        Context::Wires => None,
-                        Context::Control => self
+                        (Context::Group, _) => self
+                            .enclosing_component_name(node)
+                            .and_then(|comp_name| self.components.get(&comp_name))
+                            .map(|ci| {
+                                QueryResult::Found(
+                                    ci.cells
+                                        .keys()
+                                        .map(|g| (g.to_string(), "cell".to_string()))
+                                        .chain(ci.groups.iter().flat_map(|g| {
+                                            vec![
+                                                (format!("{g}[go]",), "hole".to_string()),
+                                                (format!("{g}[done]"), "hole".to_string()),
+                                                (format!("{g}"), "hole".to_string()),
+                                            ]
+                                        }))
+                                        .collect(),
+                                )
+                            }),
+                        (Context::Wires, _) => self
+                            .enclosing_component_name(node)
+                            .and_then(|comp_name| self.components.get(&comp_name))
+                            .map(|ci| {
+                                QueryResult::Found(
+                                    ci.cells
+                                        .keys()
+                                        .map(|g| (g.to_string(), "cell".to_string()))
+                                        .collect(),
+                                )
+                            }),
+
+                        (Context::Control, _) => self
                             .enclosing_component_name(node)
                             .and_then(|comp_name| self.components.get(&comp_name))
                             .map(|ci| {
