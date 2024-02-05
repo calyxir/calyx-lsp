@@ -168,7 +168,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                     completion_item: None,
                 }),
-                hover_provider: Some(lspt::HoverProviderCapability::Simple(true)),
+                hover_provider: Some(lspt::HoverProviderCapability::Simple(false)),
                 ..Default::default()
             },
             ..Default::default()
@@ -200,19 +200,19 @@ impl LanguageServer for Backend {
         self.update_symbols(&params.text_document.uri);
     }
 
-    async fn hover(&self, params: lspt::HoverParams) -> jsonrpc::Result<Option<lspt::Hover>> {
-        let url = params.text_document_position_params.text_document.uri;
-        let point: Point = params.text_document_position_params.position.into();
-        Ok(self.read_document(&url, |doc| {
-            let ctx = doc.context_at_point(&point);
-            Some(lspt::Hover {
-                contents: lspt::HoverContents::Scalar(lspt::MarkedString::String(format!(
-                    "{ctx:?}"
-                ))),
-                range: None,
-            })
-        }))
-    }
+    // async fn hover(&self, params: lspt::HoverParams) -> jsonrpc::Result<Option<lspt::Hover>> {
+    //     let url = params.text_document_position_params.text_document.uri;
+    //     let point: Point = params.text_document_position_params.position.into();
+    //     Ok(self.read_document(&url, |doc| {
+    //         let ctx = doc.context_at_point(&point);
+    //         Some(lspt::Hover {
+    //             contents: lspt::HoverContents::Scalar(lspt::MarkedString::String(format!(
+    //                 "{ctx:?}"
+    //             ))),
+    //             range: None,
+    //         })
+    //     }))
+    // }
 
     async fn goto_definition(
         &self,
