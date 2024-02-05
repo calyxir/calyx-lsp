@@ -10,8 +10,7 @@ use tower_lsp::lsp_types as lspt;
 use tree_sitter as ts;
 
 use crate::convert::{Contains, Point, Range};
-use crate::goto_definition::QueryResult;
-use crate::log::{self, Debug};
+use crate::log;
 use crate::ts_utils::ParentUntil;
 use crate::{tree_sitter_calyx, Config};
 
@@ -21,16 +20,16 @@ pub struct Document {
     tree: Option<ts::Tree>,
     parser: ts::Parser,
     /// Map the stores information about every component defined in this file.
-    components: HashMap<String, PrivateComponentInfo>,
+    pub components: HashMap<String, PrivateComponentInfo>,
 }
 
 /// File-private information about each component
 #[derive(Debug)]
-struct PrivateComponentInfo {
-    inputs: Vec<String>,
-    outputs: Vec<String>,
-    cells: HashMap<String, String>,
-    groups: Vec<String>,
+pub struct PrivateComponentInfo {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub cells: HashMap<String, String>,
+    pub groups: Vec<String>,
 }
 
 /// Public information about a component
@@ -97,11 +96,11 @@ impl Document {
         log::Debug::update("tree", self.tree.as_ref().unwrap().root_node().to_sexp())
     }
 
-    fn root_node(&self) -> Option<ts::Node> {
+    pub fn root_node(&self) -> Option<ts::Node> {
         self.tree.as_ref().map(|t| t.root_node())
     }
 
-    fn captures<'a, 'node: 'a>(
+    pub fn captures<'a, 'node: 'a>(
         &'a self,
         node: ts::Node<'node>,
         pattern: &str,
@@ -394,7 +393,7 @@ impl Document {
             .unwrap_or(Context::Toplevel)
     }
 
-    fn last_word_from_point(&self, point: &Point) -> Option<String> {
+    pub fn last_word_from_point(&self, point: &Point) -> Option<String> {
         let re = Regex::new(r"\b\w+\b").unwrap();
         self.text.lines().nth(point.row()).and_then(|cur_line| {
             let rev_line = cur_line[0..point.column()]
@@ -404,99 +403,6 @@ impl Document {
             re.find(&rev_line)
                 .map(|m| m.as_str().chars().rev().collect::<String>())
         })
-    }
-
-    // TODO: split this up into multiple sections
-    pub fn completion_at_point(
-        &self,
-        config: &Config,
-        point: Point,
-        trigger_char: Option<String>,
-    ) -> QueryResult<Vec<(String, String)>, String> {
-        self.last_word_from_point(&point)
-            .and_then(|word| {
-                log::stdout!("completing: {word}");
-                self.node_at_point(&point).and_then(|node| {
-                    match (self.context_at_point(&point), trigger_char.as_deref()) {
-                        (Context::Toplevel, _) => None,
-                        (Context::Component, _) => None,
-                        (Context::Cells, _) => Some(QueryResult::Found(
-                            self.components
-                                .keys()
-                                .map(|k| (k.to_string(), "component".to_string()))
-                                .collect(),
-                        )),
-                        (Context::Group, Some(".")) | (Context::Wires, Some(".")) => {
-                            self.enclosing_component_name(node)
-                                .and_then(|comp_name| self.components.get(&comp_name))
-                                .and_then(|ci| ci.cells.get(&word))
-                                .and_then(|cell_name| {
-                                    self.components
-                                        .get(cell_name)
-                                        .map(|ci| {
-                                            QueryResult::Found(
-                                                ci.inputs
-                                                    .iter()
-                                                    .map(|i| (i.to_string(), "input".to_string()))
-                                                    .chain(ci.outputs.iter().map(|o| {
-                                                        (o.to_string(), "output".to_string())
-                                                    }))
-                                                    .collect(),
-                                            )
-                                        })
-                                        .or_else(|| {
-                                            Some(QueryResult::ContinueSearch(
-                                                self.resolved_imports(config).collect(),
-                                                cell_name.to_string(),
-                                            ))
-                                        })
-                                })
-                        }
-                        (Context::Group, _) => self
-                            .enclosing_component_name(node)
-                            .and_then(|comp_name| self.components.get(&comp_name))
-                            .map(|ci| {
-                                QueryResult::Found(
-                                    ci.cells
-                                        .keys()
-                                        .map(|g| (g.to_string(), "cell".to_string()))
-                                        .chain(ci.groups.iter().flat_map(|g| {
-                                            vec![
-                                                (format!("{g}[go]",), "hole".to_string()),
-                                                (format!("{g}[done]"), "hole".to_string()),
-                                                (format!("{g}"), "hole".to_string()),
-                                            ]
-                                        }))
-                                        .collect(),
-                                )
-                            }),
-                        (Context::Wires, _) => self
-                            .enclosing_component_name(node)
-                            .and_then(|comp_name| self.components.get(&comp_name))
-                            .map(|ci| {
-                                QueryResult::Found(
-                                    ci.cells
-                                        .keys()
-                                        .map(|g| (g.to_string(), "cell".to_string()))
-                                        .collect(),
-                                )
-                            }),
-
-                        (Context::Control, _) => self
-                            .enclosing_component_name(node)
-                            .and_then(|comp_name| self.components.get(&comp_name))
-                            .map(|ci| {
-                                QueryResult::Found(
-                                    ci.groups
-                                        .iter()
-                                        .map(|g| (g.to_string(), "group".to_string()))
-                                        .collect(),
-                                )
-                            }),
-                    }
-                })
-            })
-            .unwrap_or(QueryResult::Found(vec![]))
     }
 
     pub fn node_text(&self, node: &ts::Node) -> &str {

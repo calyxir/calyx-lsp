@@ -40,7 +40,7 @@ impl Debug {
 
 macro_rules! stdout {
     ($($t:tt)*) => {{
-        Debug::stdout(format!($($t)*))
+        log::Debug::stdout(format!($($t)*))
     }};
 }
 
