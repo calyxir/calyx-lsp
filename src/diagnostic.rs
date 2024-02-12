@@ -2,8 +2,6 @@ use std::{path::PathBuf, process::Command};
 
 use serde::Deserialize;
 
-use crate::log;
-
 pub struct Diagnostic;
 
 #[derive(Deserialize, Debug)]

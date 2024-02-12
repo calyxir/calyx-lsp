@@ -241,6 +241,7 @@ impl LanguageServer for Backend {
         self.update_symbols(&params.text_document.uri);
     }
 
+    #[cfg(feature = "diagnostics")]
     async fn did_save(&self, params: lspt::DidSaveTextDocumentParams) {
         let url = &params.text_document.uri;
         self.publish_diagnostics(url).await;
