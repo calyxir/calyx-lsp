@@ -100,6 +100,21 @@ impl Document {
         self.tree.as_ref().map(|t| t.root_node())
     }
 
+    pub fn byte_to_point(&self, byte_offset: usize) -> Option<Point> {
+        if byte_offset == 0 {
+            Some(Point::zero())
+        } else if byte_offset < self.text.len() {
+            let portion = &self.text[..byte_offset];
+            let lines = portion.lines();
+            let line_num = lines.clone().count();
+            let res = lines.last().map(|l| Point::new(line_num - 1, l.len()));
+            log::stdout!("{byte_offset} -> {res:?}");
+            res
+        } else {
+            None
+        }
+    }
+
     pub fn captures<'a, 'node: 'a>(
         &'a self,
         node: ts::Node<'node>,

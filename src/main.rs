@@ -1,5 +1,6 @@
 mod completion;
 mod convert;
+mod diagnostic;
 mod document;
 mod goto_definition;
 mod log;
@@ -10,7 +11,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::RwLock;
 
-use convert::Point;
+use convert::{Point, Range};
+use diagnostic::Diagnostic;
 use document::{ComponentSig, Document};
 use goto_definition::DefinitionProvider;
 use query_result::QueryResult2;
@@ -127,6 +129,39 @@ impl Backend {
                     .unwrap()
             });
     }
+
+    async fn publish_diagnostics(&self, url: &lspt::Url) {
+        let diags = self
+            .read_document(url, |doc| {
+                Some(
+                    Diagnostic::did_save(&url.to_file_path().unwrap())
+                        .into_iter()
+                        .filter_map(|diag| {
+                            doc.byte_to_point(diag.pos_start).and_then(|s| {
+                                doc.byte_to_point(diag.pos_end)
+                                    .map(|e| (Range::new(s, e), diag.msg))
+                            })
+                        })
+                        .map(|(range, message)| lspt::Diagnostic {
+                            range: range.into(),
+                            severity: Some(lspt::DiagnosticSeverity::ERROR),
+                            code: None,
+                            code_description: None,
+                            source: Some("calyx".to_string()),
+                            message,
+                            related_information: None,
+                            tags: None,
+                            data: None,
+                        })
+                        .inspect(|diag| log::stdout!("{diag:#?}"))
+                        .collect(),
+                )
+            })
+            .unwrap_or(vec![]);
+        self.client
+            .publish_diagnostics(url.clone(), diags, None)
+            .await;
+    }
 }
 
 /// TODO: turn this into a trait
@@ -157,8 +192,14 @@ impl LanguageServer for Backend {
             server_info: None,
             capabilities: lspt::ServerCapabilities {
                 // TODO: switch to incremental parsing
-                text_document_sync: Some(lspt::TextDocumentSyncCapability::Kind(
-                    lspt::TextDocumentSyncKind::FULL,
+                text_document_sync: Some(lspt::TextDocumentSyncCapability::Options(
+                    lspt::TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(lspt::TextDocumentSyncKind::FULL),
+                        will_save: None,
+                        will_save_wait_until: None,
+                        save: Some(lspt::TextDocumentSyncSaveOptions::Supported(true)),
+                    },
                 )),
                 definition_provider: Some(lspt::OneOf::Left(true)),
                 completion_provider: Some(lspt::CompletionOptions {
@@ -183,10 +224,10 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: lspt::DidOpenTextDocumentParams) {
         self.open(params.text_document.uri.clone(), params.text_document.text);
+        self.publish_diagnostics(&params.text_document.uri).await;
     }
 
     async fn did_change_configuration(&self, params: lspt::DidChangeConfigurationParams) {
-        log::stdout!("{}", params.settings);
         let config: Config = serde_json::from_value(params.settings).unwrap();
         *self.config.write().unwrap() = config;
     }
@@ -200,19 +241,10 @@ impl LanguageServer for Backend {
         self.update_symbols(&params.text_document.uri);
     }
 
-    // async fn hover(&self, params: lspt::HoverParams) -> jsonrpc::Result<Option<lspt::Hover>> {
-    //     let url = params.text_document_position_params.text_document.uri;
-    //     let point: Point = params.text_document_position_params.position.into();
-    //     Ok(self.read_document(&url, |doc| {
-    //         let ctx = doc.context_at_point(&point);
-    //         Some(lspt::Hover {
-    //             contents: lspt::HoverContents::Scalar(lspt::MarkedString::String(format!(
-    //                 "{ctx:?}"
-    //             ))),
-    //             range: None,
-    //         })
-    //     }))
-    // }
+    async fn did_save(&self, params: lspt::DidSaveTextDocumentParams) {
+        let url = &params.text_document.uri;
+        self.publish_diagnostics(url).await;
+    }
 
     async fn goto_definition(
         &self,
@@ -266,7 +298,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
-        Debug::stdout("shutdown");
+        log::stdout!("shutdown");
         Ok(())
     }
 }
