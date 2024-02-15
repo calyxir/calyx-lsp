@@ -5,10 +5,15 @@ edition = "2021"
 
 [features]
 diagnostics = []
+log = []
+# default = ["diagnostics", "log"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+calyx-frontend = { path = "../calyx/calyx-frontend" }
+calyx-ir = { path = "../calyx/calyx-ir" }
+calyx-utils = { path = "../calyx/calyx-utils" }
 chrono = "0.4.33"
 itertools = "0.12.1"
 regex = "1.10.3"

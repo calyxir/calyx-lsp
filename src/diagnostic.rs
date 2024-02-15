@@ -1,10 +1,12 @@
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
-use serde::Deserialize;
+use calyx_frontend;
+use calyx_ir;
+use calyx_utils::ErrorExt;
 
 pub struct Diagnostic;
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub struct CalyxError {
     #[allow(unused)]
     pub file_name: String,
@@ -14,16 +16,19 @@ pub struct CalyxError {
 }
 
 impl Diagnostic {
-    pub fn did_save(path: &PathBuf) -> Vec<CalyxError> {
-        let output = Command::new("calyx")
-            .arg(path.to_str().unwrap())
-            .args(["-l", "/Users/sgt/Research/calyx"])
-            .args(["-p", "none"])
-            .arg("--json-error")
-            .output()
-            .expect("Failed to run command");
-        serde_json::from_slice(&output.stdout)
-            .map(|e| vec![e])
-            .unwrap_or(vec![])
+    pub fn did_save(path: &PathBuf, lib_path: &PathBuf) -> Vec<CalyxError> {
+        calyx_frontend::Workspace::construct(&Some(path.clone()), lib_path)
+            .and_then(|ws| calyx_ir::from_ast::ast_to_ir(ws))
+            .map(|_| vec![])
+            .unwrap_or_else(|e| {
+                let (file_name, pos_start, pos_end) = e.location();
+                let msg = e.message();
+                vec![CalyxError {
+                    file_name: file_name.to_string(),
+                    pos_start,
+                    pos_end,
+                    msg,
+                }]
+            })
     }
 }

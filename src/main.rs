@@ -9,6 +9,7 @@ mod ts_utils;
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 use convert::{Point, Range};
@@ -131,10 +132,13 @@ impl Backend {
     }
 
     async fn publish_diagnostics(&self, url: &lspt::Url) {
+        let lib_path: PathBuf = self.config.read().unwrap().calyx_lsp.library_paths[0]
+            .to_string()
+            .into();
         let diags = self
             .read_document(url, |doc| {
                 Some(
-                    Diagnostic::did_save(&url.to_file_path().unwrap())
+                    Diagnostic::did_save(&url.to_file_path().unwrap(), &lib_path)
                         .into_iter()
                         .filter_map(|diag| {
                             doc.byte_to_point(diag.pos_start).and_then(|s| {
@@ -230,6 +234,12 @@ impl LanguageServer for Backend {
     async fn did_change_configuration(&self, params: lspt::DidChangeConfigurationParams) {
         let config: Config = serde_json::from_value(params.settings).unwrap();
         *self.config.write().unwrap() = config;
+
+        // update the diagnostics on all open documents
+        let open_docs: Vec<_> = self.open_docs.read().unwrap().keys().cloned().collect();
+        for x in open_docs {
+            self.publish_diagnostics(&x).await;
+        }
     }
 
     async fn did_change(&self, params: lspt::DidChangeTextDocumentParams) {
